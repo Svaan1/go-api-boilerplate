@@ -1,0 +1,13 @@
+.git
+.omp
+.env
+.env.*
+!.env.example
+bin
+coverage.out
+*.exe
+*.test
+README.md
+CONTRIBUTING.md
+migrations
+.github

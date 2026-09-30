@@ -1,0 +1,59 @@
+services:
+  postgres:
+    # Local development credentials only. Never reuse outside this Compose stack.
+    image: postgres:17
+    environment:
+      POSTGRES_DB: api
+      POSTGRES_USER: local
+      POSTGRES_PASSWORD: local
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U local -d api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Placeholder is local-only; set APP_AUTH_HMAC_SECRET for local testing.
+    environment:
+      APP_ENV: development
+      APP_HTTP_ADDRESS: 0.0.0.0:8080
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgres://local:local@postgres:5432/api?sslmode=disable}
+      APP_AUTH_HMAC_SECRET: ${APP_AUTH_HMAC_SECRET:-local-compose-secret-change-before-use-000000000000}
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-grafana-only}
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:

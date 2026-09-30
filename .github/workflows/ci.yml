@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      e2e:
+        description: Run Docker Compose end-to-end test
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Format, lint, vet, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+          cache: true
+      - name: Check Generation drift
+        run: make generate-check
+      - name: Lint
+        run: make lint
+      - name: Vet and unit tests
+        run: make vet test
+      - name: Race tests
+        run: make test-race
+      - name: Build
+        run: make build
+
+  integration:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: api_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d api_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/api_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+          cache: true
+      - run: make test-integration
+
+  security:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+          cache: true
+      - run: go tool govulncheck ./...
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: go-api-boilerplate:ci
+
+  e2e:
+    name: Docker Compose end-to-end test
+    if: github.event_name == 'workflow_dispatch' && inputs.e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+          cache: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Run Compose smoke test
+        env:
+          APP_RUN_E2E: "1"
+          APP_AUTH_HMAC_SECRET: local-e2e-secret-change-before-use-000000000000
+        run: go test -tags=integration ./cmd/api -run TestDockerComposeAPIEndToEnd -count=1 -v
