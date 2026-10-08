@@ -5,5 +5,55 @@ linters:
   default: standard
   enable:
     - gosec
+    - depguard
+    - forbidigo
+    - gochecknoglobals
+    - gochecknoinits
+  settings:
+    depguard:
+      rules:
+        # Project-internal imports are policed by go-arch-lint; this rule keeps
+        # infrastructure out of the core even when it lives in the stdlib.
+        core:
+          list-mode: strict
+          files:
+            - "**/internal/features/*/domain/**"
+            - "**/internal/features/*/application/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/svaan1/go-api-boilerplate/internal/features
+          deny:
+            - pkg: net
+              desc: transport belongs in adapters/http
+            - pkg: database/sql
+              desc: persistence belongs in adapters/postgres
+            - pkg: os
+              desc: process and filesystem access belongs in platform or adapters
+            - pkg: log
+              desc: log in adapters; return errors from the core
+            - pkg: crypto/rand
+              desc: inject application.IDGenerator
+            - pkg: math/rand
+              desc: inject application.IDGenerator
+            - pkg: github.com/svaan1/go-api-boilerplate/internal/platform
+              desc: the core must not depend on platform code
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^time\.(Now|Since|Until)$
+          pkg: ^time$
+          msg: inject application.Clock
+        - pattern: ^uuid\.New.*$
+          msg: inject application.IDGenerator
+        - pattern: ^rand\..*$
+          pkg: ^(crypto/rand|math/rand|math/rand/v2)$
+          msg: inject application.IDGenerator
+  exclusions:
+    rules:
+      # Clock and randomness are only restricted in domain and application.
+      - path-except: internal/features/[^/]+/(domain|application)/
+        linters:
+          - forbidigo
 issues:
   max-same-issues: 0

@@ -1,12 +1,17 @@
 version: "2"
+# One entry per feature with a Postgres adapter. Schema comes from the
+# feature's golang-migrate files (sqlc ignores *.down.sql).
 sql:
   - engine: "postgresql"
-    schema: "migrations"
-    queries: "internal/database/query"
+    schema: "internal/features/example/adapters/postgres/migrations"
+    queries: "internal/features/example/adapters/postgres/queries"
     gen:
       go:
         package: "sqlc"
-        out: "internal/database/sqlc"
+        out: "internal/features/example/adapters/postgres/sqlc"
         sql_package: "pgx/v5"
         emit_interface: true
         emit_empty_slices: true
+        overrides:
+          - db_type: "timestamptz"
+            go_type: "time.Time"

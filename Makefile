@@ -1,15 +1,26 @@
 GO ?= go
 SQLC_VERSION := v1.29.0
 MIGRATE_VERSION := v4.18.3
+GOLANGCI_LINT_VERSION := v2.3.0
+GO_ARCH_LINT_VERSION := v1.14.0
 MIGRATE_RUN = $(GO) run -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
+SQLC_RUN = $(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
+# Each feature owns its migrations and tracks them in <feature>_schema_migrations.
+MIGRATION_DIRS := $(wildcard internal/features/*/adapters/postgres/migrations)
 
-.PHONY: fmt lint vet test test-race test-integration build generate generate-check migrate-create migrate-up migrate-down compose-up compose-down run
+.PHONY: check fmt lint arch vet test test-race test-integration build generate generate-check migrate-create migrate-up migrate-down compose-up compose-down run
+
+# Single gate: lint (incl. depguard/forbidigo/gochecknoglobals/gochecknoinits), architecture rules, tests.
+check: lint arch test
 
 fmt:
 	$(GO) fmt ./...
 
 lint:
-	$(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.3.0 run ./...
+	$(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
+
+arch:
+	$(GO) run github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION) check --project-path .
 
 vet:
 	$(GO) vet ./...
@@ -31,34 +42,32 @@ build:
 
 # sqlc is invoked at a pinned version without adding tool dependencies to go.mod.
 generate:
-	@if ! find migrations -maxdepth 1 -type f -name '*.up.sql' -print -quit | grep -q .; then echo 'sqlc generation skipped: no application schema exists'; \
-	elif ! find internal/database/query -type f -name '*.sql' -print -quit | grep -q .; then echo 'sqlc generation skipped: no SQL queries exist'; \
-	else $(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate -f sqlc.yaml; fi
+	$(SQLC_RUN) generate -f sqlc.yaml
 
 generate-check:
-	@set -eu; \
-	if ! find migrations -maxdepth 1 -type f -name '*.up.sql' -print -quit | grep -q .; then echo 'sqlc drift check skipped: no application schema exists'; exit 0; fi; \
-	if ! find internal/database/query -type f -name '*.sql' -print -quit | grep -q .; then echo 'sqlc drift check skipped: no SQL queries exist'; exit 0; fi; \
-	check_config=.sqlc-check.$$$$.yaml; check_output=.sqlc-check-output.$$$$; \
-	trap 'rm -f "$$check_config"; rm -rf "$$check_output"' EXIT HUP INT TERM; \
-	sed "s|out: \"internal/database/sqlc\"|out: \"$$check_output\"|" sqlc.yaml > "$$check_config"; \
-	$(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate -f "$$check_config"; \
-	if [ -d internal/database/sqlc ]; then diff -ru --exclude=README.md internal/database/sqlc "$$check_output"; \
-	else echo 'generated sqlc output missing; run make generate' >&2; exit 1; fi
+	$(SQLC_RUN) diff -f sqlc.yaml
 
 migrate-create:
-	@test -n "$(name)" || { echo 'usage: make migrate-create name=description' >&2; exit 2; }
-	$(MIGRATE_RUN) create -ext sql -dir migrations -format 20060102150405 -tz UTC $(name)
+	@test -n "$(feature)" && test -n "$(name)" || { echo 'usage: make migrate-create feature=example name=description' >&2; exit 2; }
+	@test -d "internal/features/$(feature)" || { echo 'unknown feature: $(feature)' >&2; exit 2; }
+	$(MIGRATE_RUN) create -ext sql -dir internal/features/$(feature)/adapters/postgres/migrations -format 20060102150405 -tz UTC $(name)
 
 migrate-up:
-	@if ! find migrations -maxdepth 1 -type f -name '*.up.sql' -print -quit | grep -q .; then echo 'migration skipped: no application schema exists; database unchanged'; \
-	elif [ -z "$$APP_DATABASE_URL" ]; then echo 'APP_DATABASE_URL is required before applying migrations' >&2; exit 1; \
-	else $(MIGRATE_RUN) -path migrations -database "$$APP_DATABASE_URL" up; fi
+	@if [ -z "$$APP_DATABASE_URL" ]; then echo 'APP_DATABASE_URL is required before applying migrations' >&2; exit 1; fi
+	@set -e; for dir in $(MIGRATION_DIRS); do \
+		feature=$$(echo "$$dir" | cut -d/ -f3); \
+		case "$$APP_DATABASE_URL" in *\?*) sep='&';; *) sep='?';; esac; \
+		echo "migrating $$feature"; \
+		$(MIGRATE_RUN) -path "$$dir" -database "$$APP_DATABASE_URL$${sep}x-migrations-table=$${feature}_schema_migrations" up; \
+	done
 
+# Rolls back one version of one feature.
 migrate-down:
-	@if ! find migrations -maxdepth 1 -type f -name '*.up.sql' -print -quit | grep -q .; then echo 'migration rollback skipped: no application schema exists; database unchanged'; \
-	elif [ -z "$$APP_DATABASE_URL" ]; then echo 'APP_DATABASE_URL is required before rolling back migrations' >&2; exit 1; \
-	else $(MIGRATE_RUN) -path migrations -database "$$APP_DATABASE_URL" down 1; fi
+	@test -n "$(feature)" || { echo 'usage: make migrate-down feature=example' >&2; exit 2; }
+	@test -d "internal/features/$(feature)/adapters/postgres/migrations" || { echo 'feature has no migrations: $(feature)' >&2; exit 2; }
+	@if [ -z "$$APP_DATABASE_URL" ]; then echo 'APP_DATABASE_URL is required before rolling back migrations' >&2; exit 1; fi
+	@case "$$APP_DATABASE_URL" in *\?*) sep='&';; *) sep='?';; esac; \
+	$(MIGRATE_RUN) -path "internal/features/$(feature)/adapters/postgres/migrations" -database "$$APP_DATABASE_URL$${sep}x-migrations-table=$(feature)_schema_migrations" down 1
 
 compose-up:
 	docker compose up --build -d

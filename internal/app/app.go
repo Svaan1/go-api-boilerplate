@@ -1,31 +1,31 @@
-// Package app owns application composition and resource lifecycle.
+// Package app is the composition root: it builds platform resources, wires
+// feature modules, and owns process resource lifecycle.
 package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/svaan1/go-api-boilerplate/internal/auth"
-	"github.com/svaan1/go-api-boilerplate/internal/config"
-	"github.com/svaan1/go-api-boilerplate/internal/database"
-	"github.com/svaan1/go-api-boilerplate/internal/httpapi"
-	"github.com/svaan1/go-api-boilerplate/internal/observability"
-	"github.com/svaan1/go-api-boilerplate/internal/ratelimit"
+	systemapp "github.com/svaan1/go-api-boilerplate/internal/features/system/application"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/auth"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/config"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/database"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/httpserver"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/observability"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/ratelimit"
 )
 
-// App owns HTTP serving and its bounded shutdown.
+var _ systemapp.HealthChecker = database.HealthCheck{}
+
+// App owns HTTP serving, the database pool, and their bounded shutdown.
 type App struct {
-	pool            *pgxpool.Pool
-	server          *http.Server
-	shutdownTimeout time.Duration
-	logger          *slog.Logger
+	pool   *pgxpool.Pool
+	server *httpserver.Server
+	logger *slog.Logger
 }
 
 // New constructs process resources without starting background work.
@@ -34,63 +34,46 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("constructing verifier: %w", err)
 	}
-	limiter := ratelimit.New(cfg.RateLimit, nil)
 	pool, err := database.Open(context.Background(), cfg.Database, logger)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
-	handler, err := httpapi.NewRouter(cfg, httpapi.Dependencies{
-		Logger: logger, Database: pool, Pool: pool, Verifier: verifier,
-		Limiter: limiter, Metrics: observability.New(),
+	handler, err := newHandler(cfg, platform{
+		logger:         logger,
+		verifier:       verifier,
+		limiter:        ratelimit.New(cfg.RateLimit, nil),
+		metrics:        observability.New(),
+		pool:           pool,
+		healthCheckers: []systemapp.HealthChecker{database.NewHealthCheck(pool)},
 	})
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("constructing router: %w", err)
 	}
-	return &App{
-		server: &http.Server{
-			Addr: cfg.HTTP.Address, Handler: handler,
-			ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
-			ReadTimeout:       cfg.HTTP.ReadTimeout, WriteTimeout: cfg.HTTP.WriteTimeout,
-			IdleTimeout: cfg.HTTP.IdleTimeout, MaxHeaderBytes: cfg.HTTP.MaxHeaderBytes,
-		},
-		shutdownTimeout: cfg.Shutdown.Timeout,
-		logger:          logger,
-	}, nil
+	return &App{pool: pool, server: httpserver.NewServer(cfg, handler), logger: logger}, nil
 }
 
-// Run serves until context cancellation or unexpected listener failure.
+// Run serves until context cancellation or unexpected listener failure, then
+// closes the database pool after HTTP has drained.
 func (a *App) Run(ctx context.Context) error {
 	defer a.pool.Close()
-	listener, err := net.Listen("tcp", a.server.Addr)
-	if err != nil {
-		return fmt.Errorf("listening: %w", err)
-	}
-	served := make(chan error, 1)
-	go func() { served <- a.server.Serve(listener) }()
-	var runErr error
-	isServed := false
-	select {
-	case err := <-served:
-		isServed = true
-		if !errors.Is(err, http.ErrServerClosed) {
-			runErr = fmt.Errorf("serving http: %w", err)
-		}
-	case <-ctx.Done():
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.shutdownTimeout)
-	defer cancel()
-	if err := a.server.Shutdown(shutdownCtx); err != nil {
-		runErr = errors.Join(runErr, fmt.Errorf("shutting down http: %w", err))
-		if closeErr := a.server.Close(); closeErr != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("closing http: %w", closeErr))
-		}
-	}
-	if !isServed {
-		if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			runErr = errors.Join(runErr, fmt.Errorf("serving http: %w", err))
-		}
-	}
+	err := a.server.Run(ctx)
 	a.logger.Info("http stopped")
-	return runErr
+	return err
+}
+
+// platform carries process-owned resources that modules and the router share.
+type platform struct {
+	logger         *slog.Logger
+	verifier       auth.Verifier
+	limiter        ratelimit.Limiter
+	metrics        *observability.Metrics
+	pool           *pgxpool.Pool
+	healthCheckers []systemapp.HealthChecker
+}
+
+func newHandler(cfg config.Config, p platform) (http.Handler, error) {
+	return httpserver.NewRouter(cfg, httpserver.Dependencies{
+		Logger: p.logger, Verifier: p.verifier, Limiter: p.limiter, Metrics: p.metrics,
+	}, modules(cfg, p))
 }

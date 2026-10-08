@@ -1,0 +1,84 @@
+version: 3
+workdir: .
+allow:
+  depOnAnyVendor: false
+  deepScan: true
+
+# Tests may cross boundaries (e.g. use-case tests use the in-memory adapter).
+excludeFiles:
+  - "^.*_test\\.go$"
+
+vendors:
+  pgx:        { in: [ github.com/jackc/pgx/v5, github.com/jackc/pgx/v5/** ] }
+  jwt:        { in: github.com/golang-jwt/jwt/v5 }
+  prometheus: { in: github.com/prometheus/client_golang/** }
+  viper:      { in: github.com/spf13/viper }
+  xtime:      { in: golang.org/x/time/rate }
+
+# go-arch-lint has no "same feature" wildcard, so each feature declares its
+# own components. A new feature copies the example block and renames it;
+# unmapped packages fail the check.
+components:
+  cmd:                 { in: cmd/api }
+  app:                 { in: internal/app }
+
+  platform-httpserver: { in: internal/platform/httpserver }
+  platform:
+    in:
+      - internal/platform/auth
+      - internal/platform/clock
+      - internal/platform/config
+      - internal/platform/database
+      - internal/platform/database/databasetest
+      - internal/platform/httpx
+      - internal/platform/idgen
+      - internal/platform/observability
+      - internal/platform/ratelimit
+
+  system-module:       { in: internal/features/system }
+  system-application:  { in: internal/features/system/application }
+  system-adapter-http: { in: internal/features/system/adapters/http }
+
+  example-module:           { in: internal/features/example }
+  example-domain:           { in: internal/features/example/domain }
+  example-application:      { in: internal/features/example/application }
+  example-contract:         { in: internal/features/example/application/repositorytest }
+  example-adapter-http:     { in: internal/features/example/adapters/http }
+  example-adapter-memory:   { in: internal/features/example/adapters/memory }
+  example-adapter-postgres: { in: internal/features/example/adapters/postgres }
+  example-sqlc:             { in: internal/features/example/adapters/postgres/sqlc }
+
+deps:
+  cmd:
+    mayDependOn: [ app, platform ]
+
+  app:
+    anyProjectDeps: true
+    anyVendorDeps: true
+
+  platform-httpserver:
+    mayDependOn: [ platform ]
+  platform:
+    mayDependOn: [ platform ]
+    canUse: [ pgx, jwt, prometheus, viper, xtime ]
+
+  system-module:
+    mayDependOn: [ system-application, system-adapter-http, platform-httpserver ]
+  system-adapter-http:
+    mayDependOn: [ system-application, platform, platform-httpserver ]
+
+  example-module:
+    mayDependOn: [ example-application, example-adapter-http, platform-httpserver ]
+  example-application:
+    mayDependOn: [ example-domain ]
+  example-contract:
+    mayDependOn: [ example-application, example-domain ]
+  example-adapter-http:
+    mayDependOn: [ example-application, example-domain, platform, platform-httpserver ]
+  example-adapter-memory:
+    mayDependOn: [ example-application, example-domain ]
+  example-adapter-postgres:
+    mayDependOn: [ example-sqlc, example-application, example-domain, platform ]
+    canUse: [ pgx ]
+  example-sqlc:
+    canUse: [ pgx ]

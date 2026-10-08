@@ -9,7 +9,7 @@ import (
 	"syscall"
 
 	"github.com/svaan1/go-api-boilerplate/internal/app"
-	"github.com/svaan1/go-api-boilerplate/internal/config"
+	"github.com/svaan1/go-api-boilerplate/internal/platform/config"
 )
 
 func main() {

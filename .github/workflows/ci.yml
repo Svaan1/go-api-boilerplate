@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   quality:
-    name: Format, lint, vet, test, build
+    name: Lint, architecture, vet, test, build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +26,10 @@ jobs:
           cache: true
       - name: Check Generation drift
         run: make generate-check
-      - name: Lint
-        run: make lint
-      - name: Vet and unit tests
-        run: make vet test
+      - name: Lint, architecture rules, unit tests
+        run: make check
+      - name: Vet
+        run: make vet
       - name: Race tests
         run: make test-race
       - name: Build

@@ -45,7 +45,6 @@ Every supported setting and default:
 | Environment variable                 |                                   Default | Meaning                                                                                        |
 | ------------------------------------ | ----------------------------------------: | ---------------------------------------------------------------------------------------------- |
 | `APP_ENV`                            |                             `development` | Select stage YAML.                                                                             |
-| `APP_APP_PLUGINS`                    |                                  `system` | Enabled built-in plugins; unknown/duplicate names fail startup. Empty list disables plugins.   |
 | `APP_HTTP_ADDRESS`                   |                          `127.0.0.1:8080` | Listen host and port. Production/staging YAML bind `0.0.0.0:8080`; test uses `127.0.0.1:8081`. |
 | `APP_HTTP_READ_HEADER_TIMEOUT`       |                                      `5s` | Maximum time to read request headers.                                                          |
 | `APP_HTTP_READ_TIMEOUT`              |                                     `15s` | HTTP server read timeout.                                                                      |
@@ -86,14 +85,15 @@ Required secrets: `APP_DATABASE_URL` and `APP_AUTH_HMAC_SECRET`. Minimum secret 
 ## HTTP contract
 
 - `GET /healthz`: liveness only; small JSON status/timestamp. Does not prove database health.
-- `GET /readyz`: bounded PostgreSQL ping; returns `503` until dependency is available, without exposing dependency details.
+- `GET /readyz`: runs every registered health checker (PostgreSQL ping) within `APP_SHUTDOWN_READINESS_TIMEOUT`; returns `503` when any check fails or none is registered, without exposing dependency details. Logs name only the failed check.
 - `GET /metrics` (configurable or disabled): Prometheus exposition.
 - `GET /v1/me`: requires valid bearer JWT; returns authenticated subject, roles, and permissions.
-- Unknown `/v1/` route: Problem Details response; no domain endpoints are implied.
+- `POST /v1/examples`, `PATCH /v1/examples/{id}`: reference slice; require bearer JWT. Body `{"name": "..."}` (1–100 characters after trimming). Responses: `201`/`200` with `id`, `name`, `created_at`, `updated_at`; `422` invalid name, `409` duplicate name, `404` unknown id.
+- Unknown `/v1/` route: Problem Details response.
 
 Errors use `application/problem+json` with RFC 7807-style `type`, `title`, `status`, `detail`, `instance`, and optional validation errors. Internal failures return generic public detail; causes stay server-side. JSON request helpers require `application/json`, reject unknown fields and trailing JSON values, and distinguish malformed, oversized, and unsupported-media requests. Initialize slice/map response fields when API must emit `[]`/`{}` rather than `null`. JSON helper serializes times in RFC 3339 UTC.
 
-Handlers may use `apiquery.ParsePagination`: one-based `page` default 1, `page_size` default 20 and max 100, with computed zero-based offset; repeated conflicting values, invalid numbers, and overflow are validation errors. `ParseSort` accepts comma-separated `sort=field,-field` against explicit handler allowlist and rejects repeated/unknown fields. `ParseFilters` accepts handler-allowlisted filter names; identical repeated values are okay, conflicting repeats and unknown fields fail. Allowlisting does not make SQL identifiers safe: bind values and safely quote/compose only allowlisted identifiers. Resource identifiers should use UUIDv7 when resource schemas are introduced; no resource schema exists now.
+Handlers may use `httpx.ParsePagination`: one-based `page` default 1, `page_size` default 20 and max 100, with computed zero-based offset; repeated conflicting values, invalid numbers, and overflow are validation errors. `ParseSort` accepts comma-separated `sort=field,-field` against explicit handler allowlist and rejects repeated/unknown fields. `ParseFilters` accepts handler-allowlisted filter names; identical repeated values are okay, conflicting repeats and unknown fields fail. Allowlisting does not make SQL identifiers safe: bind values and safely quote/compose only allowlisted identifiers. Resource identifiers are UUIDv7 (`platform/idgen`).
 
 ## Authentication example
 
@@ -126,28 +126,62 @@ Pass printed token as `Authorization: Bearer <token>` to `GET /v1/me`. Never ena
 
 ## PostgreSQL, migrations, and sqlc
 
-Compose PostgreSQL 17 uses local-only credentials and named data volume. There is deliberately no initial schema or placeholder migration. First real application migration establishes the initial schema; its timestamp is the migration version. Add paired timestamped `.up.sql`/`.down.sql` migrations under `migrations/`, and parameterized queries under `internal/database/query/`; review and test migrations against disposable PostgreSQL before shared environments. `sqlc.yaml` generates pgx/v5 code into `internal/database/sqlc/` from migration up files and query directory. Until actual SQL exists, generation and migrations must be safely skipped; do not invent empty tables or no-op schema.
+Compose PostgreSQL 17 uses local-only credentials and named data volume. Each feature owns its schema: paired timestamped golang-migrate files live in `internal/features/<feature>/adapters/postgres/migrations/`, parameterized sqlc queries in `.../adapters/postgres/queries/`, and generated pgx/v5 code in `.../adapters/postgres/sqlc/` (one `sqlc.yaml` entry per feature). Each feature tracks its versions in its own `<feature>_schema_migrations` table, so features migrate independently. The API does not migrate on startup.
 
 ```sh
 # Set target URL explicitly; verify target before every migration operation.
 export APP_DATABASE_URL='postgres://local:local@127.0.0.1:5432/api?sslmode=disable'
 # Creates paired migration files; author and review real SQL before applying.
-make migrate-create name=add_real_feature
-# Only after reviewed, non-empty up/down SQL exists:
+make migrate-create feature=example name=add_column
+# Applies every feature's pending migrations:
 make migrate-up
-# Roll back one migration version after reviewing data-loss implications:
-make migrate-down
+# Roll back one version of one feature after reviewing data-loss implications:
+make migrate-down feature=example
 make generate
 make generate-check
 ```
 
-`migrate-down` rolls back one version; review data-loss implications first. `APP_DATABASE_URL` controls target and must never appear in committed files or shared command output.
+Use unique, increasing UTC timestamps; each `.up.sql` applies one deliberate change and its `.down.sql` reverses it where safe. Verify both directions against disposable PostgreSQL before review; consider existing data, locks, table size, indexes, and old/new application versions running concurrently (prefer expand/contract). Never edit a migration after it has been applied in a shared environment; add a new forward migration. A down migration cannot restore discarded data: destructive changes need a verified backup. `APP_DATABASE_URL` controls target and must never appear in committed files or shared command output.
 
-## Plugins and workers
+## Project layout and modules
 
-`plugin.Plugin` exposes `Name() string` and `RegisterRoutes(*http.ServeMux, plugin.Dependencies) error`. Plugin dependencies expose logger, pool/transaction boundary, and authentication/role/permission route guards. Enable names with `APP_APP_PLUGINS`; built-in `system` owns `/v1/me`. Duplicate or unknown names fail startup. Add real built-in plugins deliberately; do not treat unused provider interfaces as implemented integrations.
+```text
+cmd/api/                 entry point: load config, signals, start app
+internal/app/            composition root + lifecycle; modules.go lists every module
+internal/platform/       technical infrastructure, no business knowledge
+  config/ observability/ auth/ ratelimit/ clock/ idgen/
+  httpserver/            router, middleware chain, server, Module interface
+  httpx/                 JSON helpers, query parsing, problem responses
+  database/              pool, WithTx/TxManager, HealthCheck, databasetest
+internal/features/
+  system/                health, readiness, metrics, /v1/me
+  example/               reference slice; copy it to start a feature
+    domain/              entities, value objects, domain errors (stdlib only)
+    application/         use cases + ports.go; repositorytest/ is the port contract
+    adapters/http/       handlers, DTOs, routes; only place errors become problems
+    adapters/postgres/   repository, SQL, row mapping, migrations
+    adapters/memory/     in-memory fake used by unit tests
+    module.go            constructor + route registration
+```
 
-`worker.Worker` exposes `Name() string` and `Run(context.Context) error`. Supervisor starts each worker once, recovers panic as error, cancels siblings on unexpected failure, and joins workers during bounded shutdown. Rate-limit bucket cleanup is managed worker; no dummy jobs are included.
+`httpserver.Module` exposes `Name() string` and `RegisterRoutes(*http.ServeMux) error`. A module receives its dependencies (ports, logger, clock, ID generator) through its constructor; `internal/app/modules.go` builds adapters and lists modules, so adding a feature is one constructor call there. Duplicate names, registration errors, and conflicting route patterns fail startup. Middleware order is unchanged: request ID, logging, metrics, panic recovery, security headers, CORS, body limit, client identity, rate limit, authentication, routes.
+
+Transactions: use cases depend on `application.Transactor`; `database.TxManager` implements it by carrying the `pgx.Tx` in the context, and repositories obtain it with `database.Conn(ctx, pool)`. Nested `WithinTx` calls join the outer transaction. `RenameExample` shows read-lock-update in one transaction.
+
+Readiness: `system` depends on `application.HealthChecker`; `database.HealthCheck` implements it and `app` registers it. Add other dependency checks the same way.
+
+To add a feature: copy `internal/features/example`, rename identifiers, add its component block to `.go-arch-lint.yml` (unmapped packages fail `make arch`), add an `sqlc.yaml` entry if it has queries, and add one constructor call in `internal/app/modules.go`.
+
+Rate-limit bucket cleanup (`ratelimit.Memory.Run`) exists but is not started; full buckets evict idle clients inline when capacity is reached.
+
+## Architecture rules
+
+`make check` runs golangci-lint, go-arch-lint, and unit tests. Enforced rules:
+
+- `domain` imports stdlib only; `application` imports its own `domain` only; adapters import their own `application`/`domain` plus `platform`; `module.go` imports its own slice plus `platform/httpserver`; no feature imports another; `platform` never imports `features`; `app` may import anything (go-arch-lint, `.go-arch-lint.yml`).
+- `domain`/`application` may not import `net/...`, `database/sql`, `os`, `log`, `crypto/rand`, `math/rand`, or `platform` (depguard), nor call `time.Now`/`Since`/`Until`, `uuid.New*`, or `rand.*` (forbidigo). Inject `Clock`/`IDGenerator` instead.
+- No package-level variables except sentinel errors and `var _ Port = (*Adapter)(nil)` assertions (gochecknoglobals); no `init` (gochecknoinits).
+- Every adapter asserts at compile time that it satisfies its port.
 
 ## Metrics and network exposure
 
@@ -158,9 +192,10 @@ Rate limiting uses bounded in-memory token buckets per client. It is not shared 
 ## Development, tests, and CI
 
 ```sh
+make check          # lint + architecture rules + unit tests
 make fmt
-make fmt-check
 make lint
+make arch
 make vet
 make test
 make test-race
@@ -170,7 +205,7 @@ make generate
 make generate-check
 ```
 
-Integration tests are opt-in/tagged and need PostgreSQL plus `APP_TEST_DATABASE_URL`. End-to-end test additionally requires `APP_RUN_E2E=1` and environment-only `APP_AUTH_HMAC_SECRET`. Never put secrets in CI source or artifacts. Repository CI runs formatting/generated checks, lint/static analysis, tests/race, PostgreSQL integration, build, vulnerability scan, and Docker image build.
+Integration tests are opt-in/tagged and need PostgreSQL plus `APP_TEST_DATABASE_URL`; each repository contract run gets an isolated schema with the feature's migrations applied (`platform/database/databasetest`). The repository contract in `application/repositorytest` runs against both the in-memory fake (unit) and PostgreSQL (integration). End-to-end test additionally requires `APP_RUN_E2E=1` and environment-only `APP_AUTH_HMAC_SECRET`. Never put secrets in CI source or artifacts. Repository CI runs generated-code drift checks, `make check`, vet, race tests, PostgreSQL integration, build, vulnerability scan, and Docker image build.
 
 Use `make compose-up` and `make compose-down` for repository Compose workflow, or standard `docker compose` commands shown above. `make run` runs native service. Migration target set: `migrate-create`, `migrate-up`, `migrate-down`.
 
