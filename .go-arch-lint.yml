@@ -81,4 +81,5 @@ deps:
     mayDependOn: [ example-sqlc, example-application, example-domain, platform ]
     canUse: [ pgx ]
   example-sqlc:
+    mayDependOn: [ platform ]
     canUse: [ pgx ]
